@@ -6,7 +6,7 @@ from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, HttpUrl
 
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -24,39 +24,27 @@ app = FastAPI(title="Audio Mixer Service", version="1.1.0")
 class MixRequest(BaseModel):
     voice_url: HttpUrl
     music_url: HttpUrl
-    music_volume: float = 0.18     # 0.0 - 1.0 (bed level)
+    music_volume: float = 0.18     # 0.0 - 1.0
     duck: bool = True             # sidechain ducking
     output_format: str = "mp3"    # "mp3" only for now
     loudnorm: bool = True         # normalize to podcast-ish loudness
 
 
 class PodcastMixRequest(BaseModel):
-    """
-    Creates a timeline:
-      [Intro music only] + [Voice + ducked music bed] + [Outro music only]
-
-    If you want separate intro/outro tracks later, add intro_music_url/outro_music_url.
-    """
     voice_url: HttpUrl
-    music_url: HttpUrl
+    bed_url: HttpUrl                 # background music under voice (looped)
+    intro_url: Optional[HttpUrl] = None
+    outro_url: Optional[HttpUrl] = None
 
-    # segment lengths
-    intro_seconds: float = Field(6.0, ge=0.0)
-    outro_seconds: float = Field(8.0, ge=0.0)
+    bed_volume: float = 0.18         # 0.0 - 1.0
+    duck: bool = True                # duck bed under voice
+    loudnorm: bool = True            # normalize to podcast-ish loudness
 
-    # levels
-    music_volume: float = Field(0.30, ge=0.0, le=1.0)   # bed during voice
-    intro_volume: float = Field(0.90, ge=0.0, le=1.0)   # louder intro
-    outro_volume: float = Field(0.90, ge=0.0, le=1.0)   # louder outro
+    # Smooth transitions
+    intro_xfade_sec: float = 1.50    # crossfade intro -> podcast
+    outro_xfade_sec: float = 1.50    # crossfade podcast -> outro
 
-    # behavior
-    duck: bool = True
-    loudnorm: bool = True
-    output_format: str = "mp3"
-
-    # polish
-    fade_in_seconds: float = Field(0.25, ge=0.0)        # intro fade-in
-    fade_out_seconds: float = Field(2.5, ge=0.0)        # outro fade-out
+    output_format: str = "mp3"       # mp3 only
 
 
 # -----------------------------
@@ -64,7 +52,7 @@ class PodcastMixRequest(BaseModel):
 # -----------------------------
 
 def _download_to(path: str, url: str):
-    with requests.get(url, stream=True, timeout=180) as r:
+    with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
@@ -72,22 +60,61 @@ def _download_to(path: str, url: str):
                     f.write(chunk)
 
 
-def _ffmpeg_run(cmd: list[str]) -> None:
+def _ffprobe_duration(path: str) -> float:
+    """
+    Return duration in seconds (float). Raises on error.
+    """
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {p.stderr[-2000:]}")
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        raise RuntimeError(f"ffprobe returned invalid duration: {p.stdout!r}")
+
+
+def _run(cmd: list[str]):
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        err = (proc.stderr or "")[-3500:]
-        raise RuntimeError(f"ffmpeg failed: {err}")
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr[-2000:]}")
 
 
-def _run_ffmpeg_mix(
-    voice_path: str,
-    music_path: str,
-    out_path: str,
-    music_volume: float,
-    duck: bool,
-    loudnorm: bool
-):
-    # Loop music to cover voice length, set volume, optional ducking, mix to voice duration
+def _supabase_upload(file_path: str, object_path: str, content_type: str = "audio/mpeg") -> str:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars")
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+
+    with open(file_path, "rb") as f:
+        r = requests.post(upload_url, headers=headers, data=f, timeout=180)
+
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Supabase upload failed: {r.status_code} {r.text[:500]}")
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{object_path}"
+    return public_url
+
+
+# -----------------------------
+# Core audio ops
+# -----------------------------
+
+def _run_ffmpeg_mix(voice_path: str, music_path: str, out_path: str, music_volume: float, duck: bool, loudnorm: bool):
+    """
+    Mix voice (0) with looped bed music (1) to duration of voice.
+    """
     if duck:
         filter_complex = (
             f"[1:a]aloop=loop=-1:size=2147483647,volume={music_volume}[m];"
@@ -117,104 +144,114 @@ def _run_ffmpeg_mix(
         "-b:a", "192k",
         out_path
     ]
-    _ffmpeg_run(cmd)
+    _run(cmd)
 
 
-def _run_ffmpeg_podcast_timeline(
+def _run_ffmpeg_podcast(
     voice_path: str,
-    music_path: str,
+    bed_path: str,
     out_path: str,
-    intro_seconds: float,
-    outro_seconds: float,
-    music_volume: float,
-    intro_volume: float,
-    outro_volume: float,
+    bed_volume: float,
     duck: bool,
     loudnorm: bool,
-    fade_in_seconds: float,
-    fade_out_seconds: float,
+    intro_path: Optional[str],
+    outro_path: Optional[str],
+    intro_xfade_sec: float,
+    outro_xfade_sec: float,
 ):
     """
-    Timeline:
-      A) Intro: music only, trimmed to intro_seconds, optional fade in
-      B) Body: voice + looped music bed (ducked), duration=voice
-      C) Outro: music only, trimmed to outro_seconds, fade out
-
-    Then concat A+B+C.
+    Build:
+      intro (optional) -> crossfade -> (voice+bed mix) -> crossfade -> outro (optional)
+    Uses acrossfade for smooth transitions.
     """
-    # Avoid ffmpeg complaining about fade longer than segment
-    intro_fade = max(0.0, min(fade_in_seconds, intro_seconds)) if intro_seconds > 0 else 0.0
-    outro_fade = max(0.0, min(fade_out_seconds, outro_seconds)) if outro_seconds > 0 else 0.0
 
-    # Segment A: intro music only
-    # Segment B: voice + bed (ducked)
-    # Segment C: outro music only + fade out
+    if not (0.0 <= bed_volume <= 1.0):
+        raise ValueError("bed_volume must be between 0.0 and 1.0")
 
-    # Intro chain
-    intro_chain = ""
-    if intro_seconds > 0:
-        intro_chain = (
-            f"[1:a]atrim=0:{intro_seconds},asetpts=PTS-STARTPTS,"
-            f"volume={intro_volume}"
-        )
-        if intro_fade > 0:
-            intro_chain += f",afade=t=in:st=0:d={intro_fade}"
-        intro_chain += "[intro];"
-    else:
-        # generate silent 0-length segment not needed; we will skip concat inputs later
-        pass
+    # durations to keep crossfades safe
+    voice_dur = _ffprobe_duration(voice_path)
 
-    # Body chain (voice + bed)
+    # intro/outro may be None
+    intro_dur = _ffprobe_duration(intro_path) if intro_path else 0.0
+    outro_dur = _ffprobe_duration(outro_path) if outro_path else 0.0
+
+    # Clamp xfade so we never exceed segment lengths (avoid ffmpeg errors)
+    def clamp_xfade(xfade: float, seg_dur: float) -> float:
+        if seg_dur <= 0:
+            return 0.0
+        # must be strictly less than segment length; keep a tiny margin
+        return max(0.0, min(xfade, max(0.0, seg_dur - 0.05)))
+
+    intro_x = clamp_xfade(float(intro_xfade_sec), intro_dur) if intro_path else 0.0
+    outro_x = clamp_xfade(float(outro_xfade_sec), outro_dur) if outro_path else 0.0
+
+    # Build the main podcast mix first (voice+looped bed) as a named stream [pod]
     if duck:
-        body_chain = (
-            f"[1:a]aloop=loop=-1:size=2147483647,volume={music_volume}[m];"
-            f"[m][0:a]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=2000[bed];"
-            f"[0:a][bed]amix=inputs=2:duration=first:dropout_transition=3,asetpts=PTS-STARTPTS[body];"
+        pod_mix = (
+            f"[bed]aloop=loop=-1:size=2147483647,volume={bed_volume}[m];"
+            f"[m][voice]sidechaincompress=threshold=0.02:ratio=8:attack=5:release=2000[bg];"
+            f"[voice][bg]amix=inputs=2:duration=first:dropout_transition=3[pod]"
         )
     else:
-        body_chain = (
-            f"[1:a]aloop=loop=-1:size=2147483647,volume={music_volume}[m];"
-            f"[0:a][m]amix=inputs=2:duration=first:dropout_transition=3,asetpts=PTS-STARTPTS[body];"
+        pod_mix = (
+            f"[bed]aloop=loop=-1:size=2147483647,volume={bed_volume}[m];"
+            f"[voice][m]amix=inputs=2:duration=first:dropout_transition=3[pod]"
         )
 
-    # Outro chain
-    outro_chain = ""
-    if outro_seconds > 0:
-        # fade-out starts at (outro_seconds - outro_fade)
-        fade_start = max(0.0, outro_seconds - outro_fade) if outro_fade > 0 else 0.0
-        outro_chain = (
-            f"[1:a]atrim=0:{outro_seconds},asetpts=PTS-STARTPTS,"
-            f"volume={outro_volume}"
-        )
-        if outro_fade > 0:
-            outro_chain += f",afade=t=out:st={fade_start}:d={outro_fade}"
-        outro_chain += "[outro];"
-    else:
-        pass
+    # We’ll normalize at the very end (after crossfades), which sounds more consistent.
+    # acrossfade curves: use tri/tri for smooth equal-power-ish transition
+    # (You can also try exp/exp if you want a slightly different feel.)
 
-    # Concat inputs list (only include segments that exist)
-    segs = []
-    if intro_seconds > 0:
-        segs.append("[intro]")
-    segs.append("[body]")
-    if outro_seconds > 0:
-        segs.append("[outro]")
+    # Inputs:
+    # 0: voice
+    # 1: bed
+    # 2: intro (optional)
+    # 3: outro (optional)
+    filter_parts = []
 
-    concat_n = len(segs)
-    concat_chain = "".join(segs) + f"concat=n={concat_n}:v=0:a=1[cat]"
+    filter_parts.append("[0:a]asetpts=PTS-STARTPTS[voice]")
+    filter_parts.append("[1:a]asetpts=PTS-STARTPTS[bed]")
+    filter_parts.append(pod_mix)
 
-    filter_complex = (intro_chain + body_chain + outro_chain + concat_chain)
+    current = "[pod]"
 
+    # Intro -> Podcast crossfade
+    if intro_path:
+        filter_parts.append("[2:a]asetpts=PTS-STARTPTS[intro]")
+        if intro_x > 0:
+            filter_parts.append(f"[intro]{current}acrossfade=d={intro_x}:curve1=tri:curve2=tri[seg1]")
+            current = "[seg1]"
+        else:
+            # no crossfade, straight concat-ish using concat filter
+            filter_parts.append(f"[intro]{current}concat=n=2:v=0:a=1[seg1]")
+            current = "[seg1]"
+
+    # Podcast -> Outro crossfade
+    if outro_path:
+        filter_parts.append("[3:a]asetpts=PTS-STARTPTS[outro]")
+        if outro_x > 0:
+            filter_parts.append(f"{current}[outro]acrossfade=d={outro_x}:curve1=tri:curve2=tri[seg2]")
+            current = "[seg2]"
+        else:
+            filter_parts.append(f"{current}[outro]concat=n=2:v=0:a=1[seg2]")
+            current = "[seg2]"
+
+    # Final normalize (optional)
     if loudnorm:
-        filter_complex += ";[cat]loudnorm=I=-16:TP=-1.5:LRA=11[out]"
+        filter_parts.append(f"{current}loudnorm=I=-16:TP=-1.5:LRA=11[out]")
         out_map = "[out]"
     else:
-        out_map = "[cat]"
+        out_map = current
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", voice_path,
-        "-i", music_path,
+    filter_complex = ";".join(filter_parts)
+
+    cmd = ["ffmpeg", "-y", "-i", voice_path, "-i", bed_path]
+    if intro_path:
+        cmd += ["-i", intro_path]
+    if outro_path:
+        cmd += ["-i", outro_path]
+
+    cmd += [
         "-filter_complex", filter_complex,
         "-map", out_map,
         "-ar", "44100",
@@ -222,29 +259,8 @@ def _run_ffmpeg_podcast_timeline(
         "-b:a", "192k",
         out_path
     ]
-    _ffmpeg_run(cmd)
 
-
-def _supabase_upload(file_path: str, object_path: str, content_type: str = "audio/mpeg") -> str:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars")
-
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{object_path}"
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Content-Type": content_type,
-        "x-upsert": "true",
-    }
-
-    with open(file_path, "rb") as f:
-        r = requests.post(upload_url, headers=headers, data=f, timeout=240)
-
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"Supabase upload failed: {r.status_code} {r.text[:800]}")
-
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{object_path}"
-    return public_url
+    _run(cmd)
 
 
 # -----------------------------
@@ -253,14 +269,7 @@ def _supabase_upload(file_path: str, object_path: str, content_type: str = "audi
 
 @app.get("/")
 def root():
-    # Render health checks / browser checks tend to hit /
-    return {"ok": True, "service": "audio-mixer", "version": "1.1.0"}
-
-
-@app.head("/")
-def root_head():
-    # Some infra uses HEAD /
-    return {}
+    return {"ok": True, "service": "podcast-mixer", "version": "1.1.0"}
 
 
 @app.get("/health")
@@ -293,18 +302,12 @@ def mix(req: MixRequest):
                 out_path=out_path,
                 music_volume=req.music_volume,
                 duck=req.duck,
-                loudnorm=req.loudnorm,
+                loudnorm=req.loudnorm
             )
 
             final_url = _supabase_upload(out_path, out_object, content_type="audio/mpeg")
 
-        return {
-            "ok": True,
-            "job_id": job_id,
-            "final_url": final_url,
-            "bucket": SUPABASE_BUCKET,
-            "object_path": out_object
-        }
+        return {"ok": True, "job_id": job_id, "final_url": final_url, "bucket": SUPABASE_BUCKET, "object_path": out_object}
 
     except requests.HTTPError as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
@@ -316,6 +319,10 @@ def mix(req: MixRequest):
 def mix_podcast(req: PodcastMixRequest):
     if req.output_format.lower() != "mp3":
         raise HTTPException(status_code=400, detail="Only output_format=mp3 is supported right now")
+    if not (0.0 <= req.bed_volume <= 1.0):
+        raise HTTPException(status_code=400, detail="bed_volume must be between 0.0 and 1.0")
+    if req.intro_xfade_sec < 0 or req.outro_xfade_sec < 0:
+        raise HTTPException(status_code=400, detail="intro_xfade_sec/outro_xfade_sec must be >= 0")
 
     job_id = str(uuid.uuid4())
     out_object = f"{OUTPUT_PREFIX}/{job_id}.mp3"
@@ -323,40 +330,34 @@ def mix_podcast(req: PodcastMixRequest):
     try:
         with tempfile.TemporaryDirectory() as td:
             voice_path = os.path.join(td, "voice")
-            music_path = os.path.join(td, "music")
+            bed_path = os.path.join(td, "bed")
+            intro_path = os.path.join(td, "intro") if req.intro_url else None
+            outro_path = os.path.join(td, "outro") if req.outro_url else None
             out_path = os.path.join(td, "final.mp3")
 
             _download_to(voice_path, str(req.voice_url))
-            _download_to(music_path, str(req.music_url))
+            _download_to(bed_path, str(req.bed_url))
+            if req.intro_url and intro_path:
+                _download_to(intro_path, str(req.intro_url))
+            if req.outro_url and outro_path:
+                _download_to(outro_path, str(req.outro_url))
 
-            _run_ffmpeg_podcast_timeline(
+            _run_ffmpeg_podcast(
                 voice_path=voice_path,
-                music_path=music_path,
+                bed_path=bed_path,
                 out_path=out_path,
-                intro_seconds=req.intro_seconds,
-                outro_seconds=req.outro_seconds,
-                music_volume=req.music_volume,
-                intro_volume=req.intro_volume,
-                outro_volume=req.outro_volume,
+                bed_volume=req.bed_volume,
                 duck=req.duck,
                 loudnorm=req.loudnorm,
-                fade_in_seconds=req.fade_in_seconds,
-                fade_out_seconds=req.fade_out_seconds,
+                intro_path=intro_path,
+                outro_path=outro_path,
+                intro_xfade_sec=req.intro_xfade_sec,
+                outro_xfade_sec=req.outro_xfade_sec,
             )
 
             final_url = _supabase_upload(out_path, out_object, content_type="audio/mpeg")
 
-        return {
-            "ok": True,
-            "job_id": job_id,
-            "final_url": final_url,
-            "bucket": SUPABASE_BUCKET,
-            "object_path": out_object,
-            "segments": {
-                "intro_seconds": req.intro_seconds,
-                "outro_seconds": req.outro_seconds
-            }
-        }
+        return {"ok": True, "job_id": job_id, "final_url": final_url, "bucket": SUPABASE_BUCKET, "object_path": out_object}
 
     except requests.HTTPError as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
