@@ -101,6 +101,17 @@ def _supabase_upload(file_path: str, object_path: str, content_type: str = "audi
     return public_url
 
 
+@app.get("/", tags=["root"])
+def root():
+    return {
+        "ok": True,
+        "service": "audio-mixer",
+        "health": "/health",
+        "mix": "/mix",
+        "docs": "/docs",
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
